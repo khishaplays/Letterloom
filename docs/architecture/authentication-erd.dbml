@@ -1,0 +1,136 @@
+// Letterloom Phase 3.1 authentication proposal.
+// This is a design artifact, not an Alembic migration or current application schema.
+// Fields marked EXISTING are in the Phase 2 models/migration. Fields marked PROPOSED
+// describe a possible authentication schema and require review before implementation.
+
+Enum one_time_token_purpose {
+  email_verification
+  password_reset
+}
+
+Table users {
+  id uuid [pk, not null, note: 'EXISTING: SQLAlchemy Python-side uuid4 default']
+  email varchar(320) [not null, unique, note: 'EXISTING: exact stored string; normalization policy is not defined']
+  created_at timestamptz [not null, default: `CURRENT_TIMESTAMP`, note: 'EXISTING server default']
+  updated_at timestamptz [not null, default: `CURRENT_TIMESTAMP`, note: 'EXISTING server default; updated by SQLAlchemy, not a database trigger']
+
+  password_hash varchar(255) [note: 'PROPOSED: nullable for Google-only accounts']
+  email_verified_at timestamptz [note: 'PROPOSED: null means email verification is incomplete']
+  display_name varchar(200) [note: 'PROPOSED']
+  email_normalized varchar(320) [unique, note: 'PROPOSED: canonical comparison value; exact normalization policy is pending']
+  deletion_requested_at timestamptz [note: 'PROPOSED: blocks access while external files are removed']
+}
+
+Table letters {
+  id uuid [pk, not null, note: 'EXISTING: SQLAlchemy Python-side uuid4 default']
+  user_id uuid [not null, note: 'EXISTING: owner']
+  title varchar(200) [not null, note: 'EXISTING']
+  content text [not null, note: 'EXISTING']
+  sealed_at timestamptz [note: 'EXISTING: null represents a draft']
+  unlock_at timestamptz [note: 'EXISTING: backend derives unlock eligibility from this date']
+  created_at timestamptz [not null, default: `CURRENT_TIMESTAMP`, note: 'EXISTING server default']
+  updated_at timestamptz [not null, default: `CURRENT_TIMESTAMP`, note: 'EXISTING server default; updated by SQLAlchemy, not a database trigger']
+
+  checks {
+    `length(trim(title)) > 0` [name: 'ck_letters_title_not_blank']
+    `sealed_at IS NULL OR (unlock_at IS NOT NULL AND unlock_at > sealed_at)` [name: 'ck_letters_sealed_unlock_after_sealed']
+  }
+
+  indexes {
+    (user_id, created_at) [name: 'ix_letters_user_created_at']
+    (user_id, unlock_at) [name: 'ix_letters_user_unlock_at']
+  }
+}
+
+Table attachments {
+  id uuid [pk, not null, note: 'EXISTING: SQLAlchemy Python-side uuid4 default']
+  letter_id uuid [not null, note: 'EXISTING: owner is inherited through the parent letter']
+  original_filename varchar(255) [not null, note: 'EXISTING metadata only']
+  media_type varchar(255) [note: 'EXISTING metadata only']
+  size_bytes bigint [not null, note: 'EXISTING']
+  storage_key varchar(1024) [not null, unique, note: 'EXISTING opaque reference; does not mean file storage is implemented']
+  created_at timestamptz [not null, default: `CURRENT_TIMESTAMP`, note: 'EXISTING server default']
+
+  checks {
+    `size_bytes >= 0` [name: 'ck_attachments_size_nonnegative']
+    `length(trim(storage_key)) > 0` [name: 'ck_attachments_storage_key_not_blank']
+  }
+
+  indexes {
+    (letter_id) [name: 'ix_attachments_letter_id']
+  }
+}
+
+Table reflections {
+  id uuid [pk, not null, note: 'EXISTING: SQLAlchemy Python-side uuid4 default']
+  letter_id uuid [not null, note: 'EXISTING: owner is inherited through the parent letter']
+  content text [not null, note: 'EXISTING']
+  created_at timestamptz [not null, default: `CURRENT_TIMESTAMP`, note: 'EXISTING server default']
+  updated_at timestamptz [not null, default: `CURRENT_TIMESTAMP`, note: 'EXISTING server default; updated by SQLAlchemy, not a database trigger']
+
+  indexes {
+    (letter_id, created_at) [name: 'ix_reflections_letter_created_at']
+  }
+}
+
+Table oauth_identities {
+  id uuid [pk, not null, note: 'PROPOSED']
+  user_id uuid [not null, note: 'PROPOSED account owner']
+  provider varchar(50) [not null, note: 'PROPOSED; Google is the initial provider']
+  provider_subject varchar(255) [not null, note: 'PROPOSED stable provider ID; Google uses verified OIDC sub']
+  created_at timestamptz [not null, note: 'PROPOSED']
+
+  indexes {
+    (provider, provider_subject) [unique, name: 'uq_oauth_identities_provider_subject']
+    (user_id) [name: 'ix_oauth_identities_user_id']
+  }
+}
+
+Table sessions {
+  id uuid [pk, not null, note: 'PROPOSED']
+  user_id uuid [not null, note: 'PROPOSED account owner']
+  token_hash varchar(64) [not null, unique, note: 'PROPOSED SHA-256 hex digest of a random opaque cookie secret']
+  csrf_token_hash varchar(64) [not null, note: 'PROPOSED digest of a per-session synchronizer token']
+  created_at timestamptz [not null, note: 'PROPOSED']
+  last_seen_at timestamptz [not null, note: 'PROPOSED']
+  expires_at timestamptz [not null, note: 'PROPOSED rolling idle expiry; inactivity limit is confirmed as seven days']
+  absolute_expires_at timestamptz [not null, note: 'PROPOSED hard expiry; 30 days is pending approval']
+  revoked_at timestamptz [note: 'PROPOSED; null means not explicitly revoked']
+
+  checks {
+    `expires_at > created_at` [name: 'ck_sessions_idle_expiry_after_creation']
+    `absolute_expires_at > created_at` [name: 'ck_sessions_absolute_expiry_after_creation']
+    `expires_at <= absolute_expires_at` [name: 'ck_sessions_idle_expiry_before_absolute_expiry']
+  }
+
+  indexes {
+    (user_id, revoked_at) [name: 'ix_sessions_user_revoked_at']
+  }
+}
+
+Table one_time_tokens {
+  id uuid [pk, not null, note: 'PROPOSED']
+  user_id uuid [not null, note: 'PROPOSED account owner']
+  purpose one_time_token_purpose [not null, note: 'PROPOSED; redemption must check the expected purpose']
+  token_hash varchar(64) [not null, unique, note: 'PROPOSED SHA-256 hex digest of a random one-use token']
+  created_at timestamptz [not null, note: 'PROPOSED']
+  expires_at timestamptz [not null, note: 'PROPOSED; purpose-specific durations are pending approval']
+  consumed_at timestamptz [note: 'PROPOSED; null means not consumed']
+
+  checks {
+    `expires_at > created_at` [name: 'ck_one_time_tokens_expiry_after_creation']
+  }
+
+  indexes {
+    (user_id, purpose, created_at) [name: 'ix_one_time_tokens_user_purpose_created']
+  }
+}
+
+// Existing ownership path: users 1 -> many letters 1 -> many attachments/reflections.
+// Proposed auth tables are owned by users and should be removed with the account.
+Ref: letters.user_id > users.id [delete: cascade]
+Ref: attachments.letter_id > letters.id [delete: cascade]
+Ref: reflections.letter_id > letters.id [delete: cascade]
+Ref: oauth_identities.user_id > users.id [delete: cascade]
+Ref: sessions.user_id > users.id [delete: cascade]
+Ref: one_time_tokens.user_id > users.id [delete: cascade]
